@@ -1,0 +1,471 @@
+import os
+os.environ["CUDA_VISIBLE_DEVICES"] = "1"
+import h5py
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader, random_split
+from torch.optim.lr_scheduler import ReduceLROnPlateau
+from sklearn.metrics import mean_squared_error
+import matplotlib.pyplot as plt
+from collections import defaultdict
+import random
+from scipy.signal import find_peaks
+import torch.nn.functional as F
+import pandas as pd
+
+seed = 42
+random.seed(seed)
+np.random.seed(seed)
+torch.manual_seed(seed)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+base_dir = r"snr_datasets1111"
+
+N = 23
+num_sources = 2
+fs = 5e10
+lens = 300
+fshift = np.linspace(-fs / 2, fs / 2 - fs / lens, lens)
+bmin = np.where(fshift >= 5e9)[0][0]
+f_sub = fshift[bmin:bmin + N].reshape(-1, 1)
+ep1 = 4.4
+v1 = 3e8
+v2 = 3e8 / np.sqrt(ep1)
+h1 = 0.1
+h2_assumed_max = 0.2
+tau_max = 2 * (h1 + h2_assumed_max)/v2 * 1.5
+tau = np.linspace(0, tau_max, 1000)
+
+
+tau1 = 2 * h1 / v1
+tau1_index = np.argmin(np.abs(tau - tau1))
+
+features = []
+h2_labels = []
+multi_labels = []
+snrs = []
+file_paths = []
+
+for folder_name in os.listdir(base_dir):
+    folder_path = os.path.join(base_dir, folder_name)
+    if os.path.isdir(folder_path):
+        try:
+            snr = float(folder_name.replace('dB', ''))
+        except ValueError:
+            print(f"跳过无效文件夹: {folder_name}")
+            continue
+        for file_name in os.listdir(folder_path):
+            if file_name.endswith('.mat'):
+                file_path = os.path.join(folder_path, file_name)
+                try:
+                    with h5py.File(file_path, 'r') as f:
+                        if 'sample_data' in f:
+                            sample_group = f['sample_data']
+                            if 'R_real' in sample_group and 'R_imag' in sample_group and 'h2' in sample_group:
+                                r_real = np.array(sample_group['R_real'])
+                                r_imag = np.array(sample_group['R_imag'])
+                                h2_array = np.array(sample_group['h2'])
+                                if h2_array.size == 0:
+                                    print(f"h2为空数组: {file_path}")
+                                    continue
+                                h2_value = float(h2_array.flatten()[0])
+                                if r_real.shape == (23, 23) and r_imag.shape == (23, 23):
+                                    feature = np.stack((r_real, r_imag), axis=-1)
+                                    features.append(feature)
+                                    h2_labels.append(h2_value)
+                                    snrs.append(snr)
+                                    file_paths.append(file_path)
+
+
+                                    tau2 = tau1 + 2 * h2_value / v2
+                                    tau2_index = np.argmin(np.abs(tau - tau2))
+
+
+                                    multi_label = np.zeros(1000)
+                                    multi_label[tau1_index] = 1
+                                    multi_label[tau2_index] = 1
+                                    multi_labels.append(multi_label)
+
+                                    print(
+                                        f"成功提取: {file_path} (h2: {h2_value}, tau1_index: {tau1_index}, tau2_index: {tau2_index})")
+                                else:
+                                    print(f"矩阵大小不匹配: {file_path}")
+                            else:
+                                print(f"缺少必要数据: {file_path}")
+                        else:
+                            print(f"缺少sample_data组: {file_path}")
+                except Exception as e:
+                    print(f"加载文件失败: {file_path} 错误: {e}")
+
+if len(features) > 0:
+    X = np.array(features)
+    y_h2 = np.array(h2_labels)
+    y_multi = np.array(multi_labels)
+    snr_array = np.array(snrs)
+    file_paths_array = np.array(file_paths)
+    if y_h2.ndim != 1:
+        raise ValueError(f"y_h2形状异常: {y_h2.shape}，期望1维。请检查h2数据。")
+    print(f"提取到 {len(features)} 个有效样本。")
+else:
+    raise ValueError("没有提取到有效数据。请检查文件结构。")
+
+mean = np.mean(X, axis=(0, 1, 2))
+std = np.std(X, axis=(0, 1, 2))
+std[std == 0] = 1.0
+
+
+class ThicknessDataset(Dataset):
+    def __init__(self, features, labels, mean=None, std=None):
+        self.features = torch.tensor(features, dtype=torch.float32).permute(0, 3, 1, 2)
+        if mean is not None and std is not None:
+            mean = torch.tensor(mean, dtype=torch.float32).view(1, 2, 1, 1)
+            std = torch.tensor(std, dtype=torch.float32).view(1, 2, 1, 1)
+            self.features = (self.features - mean) / std
+        self.labels = torch.tensor(labels, dtype=torch.float32)
+
+    def __len__(self):
+        return len(self.labels)
+
+    def __getitem__(self, idx):
+        return self.features[idx], self.labels[idx]
+
+
+from sklearn.model_selection import train_test_split
+
+X_train_val, X_test, y_multi_train_val, y_multi_test, y_h2_train_val, y_h2_test, snr_train_val, snr_test, file_paths_train_val, file_paths_test = train_test_split(
+    X, y_multi, y_h2, snr_array, file_paths_array, test_size=0.2, random_state=seed
+)
+
+train_val_dataset = ThicknessDataset(X_train_val, y_multi_train_val, mean=mean, std=std)
+test_dataset = ThicknessDataset(X_test, y_multi_test, mean=mean, std=std)
+train_size = int(0.875 * len(train_val_dataset))
+val_size = len(train_val_dataset) - train_size
+train_dataset, val_dataset = random_split(train_val_dataset, [train_size, val_size])
+
+train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True, num_workers=4)
+val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False, num_workers=4)
+test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False, num_workers=4)
+
+
+def conv3x3(in_planes, out_planes, stride=1):
+    return nn.Conv2d(in_planes, out_planes, kernel_size=3, stride=stride, padding=1, bias=False)
+
+
+class BasicBlock(nn.Module):
+    expansion = 1
+
+    def __init__(self, in_planes, planes, stride=1):
+        super(BasicBlock, self).__init__()
+        self.conv1 = conv3x3(in_planes, planes, stride)
+        self.bn1 = nn.BatchNorm2d(planes)
+        self.conv2 = conv3x3(planes, planes)
+        self.bn2 = nn.BatchNorm2d(planes)
+
+        self.shortcut = nn.Sequential()
+        if stride != 1 or in_planes != self.expansion * planes:
+            self.shortcut = nn.Sequential(
+                nn.Conv2d(in_planes, self.expansion * planes, kernel_size=1, stride=stride, bias=False),
+                nn.BatchNorm2d(self.expansion * planes)
+            )
+
+    def forward(self, x):
+        out = nn.ReLU(inplace=True)(self.bn1(self.conv1(x)))
+        out = self.bn2(self.conv2(out))
+        out += self.shortcut(x)
+        out = nn.ReLU(inplace=True)(out)
+        return out
+
+
+class SimpleResNet(nn.Module):
+    def __init__(self, block=BasicBlock, num_blocks=[2, 2, 2], num_outputs=125):
+        super(SimpleResNet, self).__init__()
+        self.in_planes = 64
+
+        self.conv1 = nn.Conv2d(2, 64, kernel_size=3, stride=1, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(64)
+        self.layer1 = self._make_layer(block, 64, num_blocks[0], stride=1)
+        self.layer2 = self._make_layer(block, 128, num_blocks[1], stride=2)
+        self.layer3 = self._make_layer(block, 256, num_blocks[2], stride=2)
+        self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
+        self.fc = nn.Linear(256 * block.expansion, num_outputs)
+
+    def _make_layer(self, block, planes, num_blocks, stride):
+        strides = [stride] + [1] * (num_blocks - 1)
+        layers = []
+        for stride in strides:
+            layers.append(block(self.in_planes, planes, stride))
+            self.in_planes = planes * block.expansion
+        return nn.Sequential(*layers)
+
+    def forward(self, x):
+        out = nn.ReLU(inplace=True)(self.bn1(self.conv1(x)))
+        out = self.layer1(out)
+        out = self.layer2(out)
+        out = self.layer3(out)
+        out = self.avgpool(out)
+        out = out.view(out.size(0), -1)
+        out = self.fc(out)
+        return out
+
+
+class CNNRegressor(nn.Module):
+    def __init__(self):
+        super(CNNRegressor, self).__init__()
+        self.branch1 = SimpleResNet()
+        self.branch2 = SimpleResNet()
+        self.branch3 = SimpleResNet()
+        self.branch4 = SimpleResNet()
+        self.branch5 = SimpleResNet()
+        self.branch6 = SimpleResNet()
+        self.branch7 = SimpleResNet()
+        self.branch8 = SimpleResNet()
+
+    def forward(self, x):
+        out1 = self.branch1(x)
+        out2 = self.branch2(x)
+        out3 = self.branch3(x)
+        out4 = self.branch4(x)
+        out5 = self.branch5(x)
+        out6 = self.branch6(x)
+        out7 = self.branch7(x)
+        out8 = self.branch8(x)
+        outputs = torch.cat([out1, out2, out3, out4, out5, out6, out7, out8], dim=1)
+        return outputs
+
+
+model = CNNRegressor()
+model = model.to('cuda')
+model = nn.DataParallel(model)
+criterion = nn.BCEWithLogitsLoss()
+optimizer = optim.Adam(model.parameters(), lr=0.0001, weight_decay=0.001)
+scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=5, verbose=True)
+
+num_epochs = 50
+best_val_loss = float('inf')
+patience = 7
+early_stop_counter = 0
+
+for epoch in range(num_epochs):
+    model.train()
+    running_loss = 0.0
+    for inputs, targets in train_loader:
+        inputs = inputs.to('cuda')
+        targets = targets.to('cuda')
+        optimizer.zero_grad()
+        outputs = model(inputs)
+        loss = criterion(outputs, targets)
+        loss.backward()
+        optimizer.step()
+        running_loss += loss.item()
+    train_loss = running_loss / len(train_loader)
+
+    model.eval()
+    val_loss = 0.0
+    with torch.no_grad():
+        for inputs, targets in val_loader:
+            inputs = inputs.to('cuda')
+            targets = targets.to('cuda')
+            outputs = model(inputs)
+            val_loss += criterion(outputs, targets).item()
+    val_loss /= len(val_loader)
+
+    print(f"Epoch {epoch + 1}/{num_epochs}, Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}")
+
+    scheduler.step(val_loss)
+    if val_loss < best_val_loss:
+        best_val_loss = val_loss
+        early_stop_counter = 0
+    else:
+        early_stop_counter += 1
+        if early_stop_counter >= patience:
+            print(f"早停于Epoch {epoch + 1}")
+            break
+
+model.eval()
+y_pred_logits = []
+with torch.no_grad():
+    for inputs, _ in test_loader:
+        inputs = inputs.to('cuda')
+        outputs = model(inputs)
+        y_pred_logits.extend(outputs.cpu().numpy())
+y_pred_logits = np.array(y_pred_logits)
+
+
+y_pred_probs = 1 / (1 + np.exp(-y_pred_logits))
+
+
+y_pred_indices = []
+for prob in y_pred_probs:
+
+    top_indices = np.argsort(prob)[-2:]
+    top_indices = sorted(top_indices)
+    if tau1_index not in top_indices and prob[tau1_index] > 0.1:
+        top_indices[0] = tau1_index
+    y_pred_indices.append(top_indices)
+y_pred_indices = np.array(y_pred_indices)
+
+
+y_h2_pred = (tau[y_pred_indices[:, 1]] - tau1) * v2 / 2
+
+
+overall_rmse = np.sqrt(mean_squared_error(y_h2_test, y_h2_pred))
+
+
+snr_rmse = defaultdict(float)
+snr_rmse_percentages = defaultdict(float)
+unique_snrs = sorted(set(snr_test))
+snr_sample_counts = defaultdict(int)
+
+for snr in unique_snrs:
+    indices = np.where(snr_test == snr)[0]
+    if len(indices) > 0:
+        rmse = np.sqrt(mean_squared_error(y_h2_test[indices], y_h2_pred[indices]))
+        group_avg = np.mean(np.abs(y_h2_test[indices])) if len(indices) > 0 else 1.0
+        rmse_percentage = (rmse / group_avg) * 100 if group_avg != 0 else 0.0
+        snr_rmse[snr] = rmse
+        snr_rmse_percentages[snr] = rmse_percentage
+        snr_sample_counts[snr] = len(indices)
+        print(
+            f"SNR {snr:.1f} dB 的 厚度RMSE: {rmse:.4f}, 厚度误差率百分比 (相对于该组平均 {group_avg:.2f}): {rmse_percentage:.2f}%")
+
+overall_avg = np.mean(np.abs(y_h2_test))
+overall_rmse_percentage = (overall_rmse / overall_avg) * 100 if overall_avg != 0 else 0.0
+overall_rmse_percentage_avg = np.mean(list(snr_rmse_percentages.values())) if snr_rmse_percentages else 0.0
+weighted_rmse_percentages_sum = sum(snr_rmse_percentages[snr] * snr_sample_counts[snr] for snr in unique_snrs)
+total_samples = sum(snr_sample_counts.values())
+overall_rmse_percentage_weighted = weighted_rmse_percentages_sum / total_samples if total_samples > 0 else 0.0
+
+print(f"整体厚度RMSE: {overall_rmse:.4f}")
+print(f"整体厚度误差率百分比 (相对于整体平均 {overall_avg:.2f}): {overall_rmse_percentage:.2f}%")
+print(f"整体厚度误差率百分比 (每个SNR百分比的简单平均): {overall_rmse_percentage_avg:.2f}%")
+print(f"整体厚度误差率百分比 (每个SNR百分比的加权平均): {overall_rmse_percentage_weighted:.2f}%")
+
+
+plt.rcParams['font.sans-serif'] = ['SimHei']
+plt.rcParams['axes.unicode_minus'] = False
+snrs_list = list(snr_rmse_percentages.keys())
+percentages = [snr_rmse_percentages[snr] for snr in snrs_list]
+plt.figure(figsize=(10, 6))
+plt.bar(snrs_list, percentages, color='skyblue')
+plt.xlabel('信噪比 (dB)')
+plt.ylabel('厚度误差率 (%)')
+plt.grid(True)
+save_path = os.path.join(base_dir, 'final-snr_thickness_percentage_bar_cnn_opt_v2.png')
+try:
+    plt.savefig(save_path, dpi=900, format='png')
+    print(f"图片保存成功: {save_path}")
+except Exception as e:
+    print(f"保存图片失败: {save_path} 错误: {e}")
+plt.show()
+
+print("\n=== 开始生成MUSIC谱图 ===")
+
+output_dir = r"ours"
+os.makedirs(output_dir, exist_ok=True)
+
+snr_groups = defaultdict(list)
+for i, snr in enumerate(snr_test):
+    snr_groups[snr].append(i)
+
+for snr, indices in snr_groups.items():
+    errors = np.abs(y_h2_test[indices] - y_h2_pred[indices])
+    min_error_idx = np.argmin(errors)
+    selected_idx = indices[min_error_idx]
+
+
+    file_path = file_paths_test[selected_idx]
+    h2_true = y_h2_test[selected_idx]
+    tau2_index_true = np.argmin(np.abs(tau - (2 * h1 / v1 + 2 * h2_true / v2)))
+
+    print(f"\n=== 测试样本提取信息 (SNR {snr:.1f} dB, 测试集索引 {selected_idx}) ===")
+    print(f"文件路径: {file_path}")
+    print(f"真实h2: {h2_true:.4f}")
+    print(f"tau1_index (固定): {tau1_index}")
+    print(f"tau2_index (真实): {tau2_index_true}")
+    print(f"SNR: {snr:.1f} dB")
+    print("=== 提取信息结束 ===")
+
+    print(f"\nSNR {snr:.1f} dB: 样本(测试集索引 {selected_idx})")
+    h2_pred = y_h2_pred[selected_idx]
+    prediction_error = abs(h2_true - h2_pred)
+    print(f"  真实厚度 (h2_true): {h2_true:.4f}")
+    print(f"  预测厚度 (h2_pred): {h2_pred:.4f}")
+    print(f"  预测误差: {prediction_error:.4f}")
+
+    P_music_pred = y_pred_probs[selected_idx]
+    pred_indices = y_pred_indices[selected_idx]
+
+
+    if pred_indices[0] != tau1_index and P_music_pred[tau1_index] > 0.1:
+        pred_indices[0] = tau1_index
+
+    peaks, properties = find_peaks(P_music_pred, height=0.1, prominence=0.05)
+    if len(peaks) < 2:
+        print(f"  find_peaks 检测到 {len(peaks)} 个峰，强制使用 top-2 索引")
+        peaks = pred_indices
+    else:
+
+        sorted_peaks = sorted(peaks, key=lambda x: P_music_pred[x], reverse=True)[:2]
+        peaks = sorted(sorted_peaks)
+        if tau1_index in sorted_peaks:
+            peaks = [tau1_index, sorted_peaks[0] if sorted_peaks[0] != tau1_index else sorted_peaks[1]]
+        else:
+            peaks = pred_indices
+
+    print(f"  检测到 2 个峰值：索引 {peaks[0]} (固定), {peaks[1]} (变量)")
+    tau_ests = [tau[idx] for idx in peaks]
+    h2_musics = [0 if i == 0 else (tau_ests[i] - tau1) * v2 / 2 for i in range(2)]
+    music_errors = [0 if i == 0 else abs(h2_true - h2_musics[i]) for i in range(2)]
+
+    for i, (idx, tau_est, h2_music, err) in enumerate(zip(peaks, tau_ests, h2_musics, music_errors)):
+        print(f"    峰 {i + 1}: 索引 {idx}, tau {tau_est:.4e}, h2 {h2_music:.4f}, 误差 {err:.4f}")
+
+
+    fig = plt.figure(figsize=(12, 6))
+    plt.plot(tau * 1e9, P_music_pred, 'b-', linewidth=2, label='MUSIC')
+    colors = ['ro', 'go']
+    labels = ['h1', 'h2']
+    for i, idx in enumerate(peaks):
+        plt.plot(tau[idx] * 1e9, P_music_pred[idx], colors[i], markersize=10, label=labels[i])
+    plt.xlabel('时间延迟 (ns)', fontsize=12)
+    plt.ylabel('MUSIC谱幅度', fontsize=12)
+    plt.legend(loc='best', fontsize=10)
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+
+    save_filename = f'snr_{snr:.1f}dB_music_spectrum_two_peaks.png'
+    save_path = os.path.join(output_dir, save_filename)
+    try:
+        plt.savefig(save_path, dpi=300, format='png', bbox_inches='tight')
+        print(f"  图片保存成功: {save_path}")
+    except Exception as e:
+        print(f"  保存图片失败: {save_path} 错误: {e}")
+    plt.close(fig)
+
+
+    try:
+
+        df = pd.DataFrame({
+            'tau_ns': tau * 1e9,
+            'amplitude': P_music_pred
+        })
+
+
+        df['peak_type'] = ''
+        if len(peaks) >= 2:
+            df.loc[peaks[0], 'peak_type'] = 'h1'
+            df.loc[peaks[1], 'peak_type'] = 'h2'
+
+        excel_filename = f'snr_{snr:.1f}dB_music_spectrum_data.xlsx'
+        excel_path = os.path.join(output_dir, excel_filename)
+        df.to_excel(excel_path, index=False, engine='openpyxl')
+        print(f"  Excel数据保存成功: {excel_path}")
+    except Exception as e:
+        print(f"  保存Excel失败: {excel_path} 错误: {e}")
+
+print("\n=== MUSIC谱图生成完成 ===")
